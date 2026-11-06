@@ -187,6 +187,23 @@ class DLNABackend(AudioBackend):
             return False
         return await self._client.get_transport_info() in ("STOPPED", "NO_MEDIA_PRESENT")
 
+    async def _read_current_uri(self) -> Optional[str]:
+        """Read the URI of the track the renderer is on.
+
+        Sonos queue playback reports the queue in CurrentURI, so it needs
+        GetPositionInfo.TrackURI. Some renderers (Bose SoundTouch) leave
+        CurrentURI empty while playing a URI we set; fall back to TrackURI for
+        them. A failed read stays None so callers can fail closed.
+        """
+        if not self._client:
+            return None
+        if self._is_sonos:
+            return await self._client.get_track_uri()
+        media_uri = await self._client.get_media_info()
+        if media_uri != "":
+            return media_uri
+        return await self._client.get_track_uri() or media_uri
+
     async def _owns_transport(self) -> bool:
         """Only control the current or armed Qobuz track; unknown sources fail closed."""
         if (
@@ -199,11 +216,7 @@ class DLNABackend(AudioBackend):
             return False
         expected = self._current_proxy_url
         armed_at_read = self._next_track_proxy_url
-        current_uri = (
-            await self._client.get_track_uri()
-            if self._is_sonos
-            else await self._client.get_media_info()
-        )
+        current_uri = await self._read_current_uri()
         # A concurrent explicit play may have replaced the track during the read.
         if (
             self._external_playback
@@ -806,12 +819,7 @@ class DLNABackend(AudioBackend):
                     and self._next_track_proxy_url
                     and self._client
                 ):
-                    # For Sonos queue playback, GetMediaInfo.CurrentURI returns the
-                    # queue URI, not the track URL. Use GetPositionInfo.TrackURI instead.
-                    if self._is_sonos:
-                        current_uri = await self._client.get_track_uri()
-                    else:
-                        current_uri = await self._client.get_media_info()
+                    current_uri = await self._read_current_uri()
                     if current_uri and current_uri == self._next_track_proxy_url:
                         logger.info("Gapless: transition detected — device moved to next track")
                         # Update state to reflect the new track

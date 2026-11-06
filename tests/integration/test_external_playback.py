@@ -366,6 +366,66 @@ async def test_standard_dlna_uses_media_uri(rig):
     client.get_track_uri.assert_not_awaited()
 
 
+@pytest.mark.parametrize("uri", [QOBUZ_URI, NEXT_URI])
+async def test_standard_dlna_without_media_uri_falls_back_to_track_uri(rig, uri):
+    """Bose SoundTouch reports an empty CurrentURI while playing our track; only
+    GetPositionInfo.TrackURI identifies it. Without the fallback every command
+    failed closed and the speaker could not be paused, stopped or skipped."""
+    backend, client, _, manager, _ = rig
+    backend._is_sonos = False
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = uri
+    await backend.seek(4000)
+    assert await backend.resume()
+    await backend.pause()
+    await backend.stop()
+    client.seek.assert_awaited_once_with(4000)
+    client.play.assert_awaited_once()
+    client.pause.assert_awaited_once()
+    client.stop.assert_awaited_once()
+    assert manager.is_renderer_active
+
+
+@pytest.mark.parametrize("track_uri", [None, ""])
+async def test_standard_dlna_without_any_uri_still_fails_closed(rig, track_uri):
+    backend, client, _, manager, _ = rig
+    backend._is_sonos = False
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = track_uri
+    await backend.pause()
+    await backend.stop()
+    assert_no_transport_writes(client)
+    assert not backend._external_playback
+    assert manager.is_renderer_active
+
+
+async def test_standard_dlna_foreign_track_uri_is_an_external_takeover(rig):
+    backend, client, _, manager, _ = rig
+    backend._is_sonos = False
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = SPOTIFY_URI
+    assert await backend.check_external_playback()
+    assert_no_transport_writes(client)
+    assert not manager.is_renderer_active
+
+
+async def test_deactivation_stops_renderer_without_media_uri(rig):
+    """Switching the Qobuz session to another speaker must stop this one."""
+    backend, client, player, manager, tasks = rig
+    backend._is_sonos = False
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = QOBUZ_URI
+    client.stop.return_value = True
+    batch = pb.QConnectBatch()
+    batch.messages.add(messageType=43).srvrRndrSetActive.active = False
+    await manager._handle_payload(
+        DecodedMessage(msg_type=MessageType.PAYLOAD, payload=batch.SerializeToString())
+    )
+    await asyncio.gather(*tasks)
+    client.stop.assert_awaited_once()
+    assert player.state == PlaybackState.STOPPED
+
+
 @pytest.mark.parametrize("uri", [None, ""])
 async def test_unknown_source_blocks_snapshot_without_relinquishing_session(rig, uri):
     backend, client, player, manager, tasks = rig
@@ -548,5 +608,16 @@ async def test_idle_renderer_without_a_uri_accepts_qobuz_again(rig, uri, transpo
     backend._is_sonos = False
     backend._next_track_proxy_url = None
     client.get_media_info.return_value = uri
+    client.get_track_uri.return_value = ""
     client.get_transport_info.return_value = transport
     assert await backend.can_apply_remote_state() is allowed
+
+
+async def test_stopped_renderer_reporting_only_our_track_uri_accepts_qobuz(rig):
+    backend, client, _, _, _ = rig
+    backend._is_sonos = False
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = QOBUZ_URI
+    client.get_transport_info.return_value = "STOPPED"
+    assert await backend.can_apply_remote_state()
+    assert not backend._external_playback
