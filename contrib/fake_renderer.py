@@ -21,6 +21,11 @@ Profiles control what GetProtocolInfo advertises:
   hires         FLAC with DLNA.ORG_PN=FLAC_192 — exercises confirmed
                 hi-res auto-detection
 
+--quirks soundtouch reproduces how a Bose SoundTouch reports its transport:
+CurrentURI stays empty while playing (only TrackURI shows the track), Stop
+drops to a standby placeholder (CurrentURI qplay://, PAUSED_PLAYBACK) and
+SetNextAVTransportURI is not supported.
+
 Usage:
     python3 contrib/fake_renderer.py --port 49494 --profile gmediarender
 
@@ -125,10 +130,17 @@ def _fmt_hms(seconds: float) -> str:
     return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
+SOUNDTOUCH_IDLE_URI = "qplay://"
+SOUNDTOUCH_IDLE_TRACK_URI = "http://invalidHost.com/invalidUri.mp3"
+
+
 class FakeRenderer:
-    def __init__(self, sink: str, on_fetch_error: Optional[str] = None):
+    def __init__(
+        self, sink: str, on_fetch_error: Optional[str] = None, quirks: Optional[str] = None
+    ):
         self.sink = sink
         self.on_fetch_error = on_fetch_error
+        self.quirks = quirks
         self._fetch_task: Optional[asyncio.Task[None]] = None
         self.volume = 39
         self.mute = 0
@@ -174,6 +186,8 @@ class FakeRenderer:
             self._position_base = 0.0
             return _soap_response(service, action, {})
         if action == "SetNextAVTransportURI":
+            if self.quirks == "soundtouch":
+                return _soap_fault(401, "Invalid Action")
             self.next_uri = _extract(body, "NextURI") or ""
             return _soap_response(service, action, {})
         if action == "Play":
@@ -194,6 +208,9 @@ class FakeRenderer:
                 self._fetch_task = None
             self.state = "STOPPED"
             self._position_base = 0.0
+            if self.quirks == "soundtouch":
+                self.state = "PAUSED_PLAYBACK"
+                self.uri = ""
             return _soap_response(service, action, {})
         if action == "Seek":
             target = _extract(body, "Target") or "0:00:00"
@@ -202,13 +219,17 @@ class FakeRenderer:
             self._play_started = time.monotonic()
             return _soap_response(service, action, {})
         if action == "GetMediaInfo":
+            media_uri = self.uri
+            if self.quirks == "soundtouch":
+                loaded = self.uri and self.state in ("PLAYING", "PAUSED_PLAYBACK")
+                media_uri = "" if loaded else SOUNDTOUCH_IDLE_URI
             return _soap_response(
                 service,
                 action,
                 {
                     "NrTracks": "1" if self.uri else "0",
                     "MediaDuration": "0:04:00",
-                    "CurrentURI": _xml_escape(self.uri),
+                    "CurrentURI": _xml_escape(media_uri),
                     "CurrentURIMetaData": "",
                     "NextURI": _xml_escape(self.next_uri),
                     "NextURIMetaData": "",
@@ -235,7 +256,9 @@ class FakeRenderer:
                 {
                     "Track": "1" if self.uri else "0",
                     "TrackDuration": "0:04:00",
-                    "TrackURI": _xml_escape(self.uri),
+                    "TrackURI": _xml_escape(
+                        self.uri or (SOUNDTOUCH_IDLE_TRACK_URI if self.quirks else "")
+                    ),
                     "RelTime": pos,
                     "AbsTime": pos,
                     "RelCount": "0",
@@ -273,6 +296,19 @@ class FakeRenderer:
             self._position_base = 0.0
 
 
+def _soap_fault(code: int, description: str) -> web.Response:
+    xml = (
+        '<?xml version="1.0"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>"
+        '<detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">'
+        f"<errorCode>{code}</errorCode><errorDescription>{description}</errorDescription>"
+        "</UPnPError></detail></s:Fault></s:Body></s:Envelope>"
+    )
+    return web.Response(status=500, text=xml, content_type="text/xml")
+
+
 def _xml_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -293,11 +329,14 @@ def main() -> None:
     parser.add_argument(
         "--on-fetch-error", choices=["stop", "stay-playing", "transitioning"], default=None
     )
+    parser.add_argument("--quirks", choices=["soundtouch"], default=None)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
-    renderer = FakeRenderer(sink=PROFILES[args.profile], on_fetch_error=args.on_fetch_error)
+    renderer = FakeRenderer(
+        sink=PROFILES[args.profile], on_fetch_error=args.on_fetch_error, quirks=args.quirks
+    )
     app = web.Application()
     app.router.add_get("/description.xml", renderer.handle_description)
     app.router.add_post("/upnp/control/avtransport", renderer.handle_soap)
