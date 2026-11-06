@@ -142,6 +142,96 @@ class TestSetStateHandling:
         assert backend.played[-1] == "1002"
 
 
+def _playing_state_only_msg(playing_state: int):
+    """SET_STATE carrying only a playing state, no currentQueueItem."""
+    msg = pb.QConnectMessage()
+    msg.messageType = 41
+    msg.srvrRndrSetState.playingState = playing_state
+    return msg
+
+
+def _queue_item_only_msg(*, track_id: int, queue_item_id: int):
+    """SET_STATE naming a new current item, without a playing state."""
+    return _set_state_msg(track_id=track_id, queue_item_id=queue_item_id, playing_state=None)
+
+
+class TestSplitSkip:
+    """The Android app's next/previous reaches the renderer as two SET_STATE
+    messages ~90 ms apart: the new currentQueueItem first, then a bare PLAYING.
+    The second must not cancel the first while it is still being applied."""
+
+    async def _playing(self):
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(_set_state_msg(track_id=1001, queue_item_id=1))
+        assert backend.played == ["1001"]
+        return player, backend, handler
+
+    async def test_bare_play_does_not_cancel_a_pending_skip(self) -> None:
+        player, backend, handler = await self._playing()
+        checking = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_permission_check() -> bool:
+            # The DLNA ownership check is a SOAP round trip to the speaker.
+            checking.set()
+            await release.wait()
+            return True
+
+        player.set_playback_permission_check(slow_permission_check)
+        skip = asyncio.create_task(
+            handler._handle_set_state(_queue_item_only_msg(track_id=1002, queue_item_id=2))
+        )
+        await checking.wait()
+        play = asyncio.create_task(handler._handle_set_state(_playing_state_only_msg(2)))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(skip, play)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "1002"
+        assert player.current_track.queue_item_id == 2
+        assert backend.played[-1] == "1002"
+        assert player.state == PlaybackState.PLAYING
+
+    async def test_split_skip_in_order_plays_the_new_track(self) -> None:
+        player, backend, handler = await self._playing()
+        await handler._handle_set_state(_queue_item_only_msg(track_id=1002, queue_item_id=2))
+        await handler._handle_set_state(_playing_state_only_msg(2))
+        assert backend.played[-1] == "1002"
+        assert player.state == PlaybackState.PLAYING
+
+    async def test_applied_skip_is_not_replayed_by_later_bare_play(self) -> None:
+        player, backend, handler = await self._playing()
+        await handler._handle_set_state(_queue_item_only_msg(track_id=1002, queue_item_id=2))
+        await handler._handle_set_state(_playing_state_only_msg(2))
+        played = list(backend.played)
+        await handler._handle_set_state(_playing_state_only_msg(3))
+        await handler._handle_set_state(_playing_state_only_msg(2))
+        assert backend.played == played
+        assert player.current_track.track_id == "1002"
+
+    async def test_deactivation_drops_an_unapplied_skip(self) -> None:
+        player, backend, handler = await self._playing()
+
+        async def denied() -> bool:
+            return False
+
+        player.set_playback_permission_check(denied)
+        await handler._handle_set_state(_queue_item_only_msg(track_id=1002, queue_item_id=2))
+        await handler._handle_set_active(_set_active_msg(False))
+
+        async def allowed() -> bool:
+            return True
+
+        player.set_playback_permission_check(allowed)
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(_playing_state_only_msg(2))
+        assert "1002" not in backend.played
+
+
 class TestNextTrackSentinel:
     """The app sends nextQueueItem with all-ones ids to mean "no next track"
     (issue #17: last track of an album with another album queued in a
