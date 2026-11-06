@@ -6,12 +6,15 @@ renderer with the same backend code the proxy uses, so play/pause/next/
 previous/stop can be tried against a real speaker (or contrib/fake_renderer.py)
 and the renderer's raw UPnP state inspected after each command.
 
-The renderer must be able to reach this machine on --serve-port.
+The renderer must be able to reach this machine on --serve-port. FLAC tones
+need the `local` extra (`uv sync --extra local`); --format wav needs nothing.
 
 Usage:
     uv run python contrib/dlna_cli.py --ip 192.168.1.152 --port 8091
     uv run python contrib/dlna_cli.py --ip 192.168.1.152 --port 8091 \\
         --run "play; wait 5; next; wait 5; prev; wait 5; pause; resume; stop"
+    uv run python contrib/fake_renderer.py --port 49494 --quirks soundtouch &
+    uv run python contrib/dlna_cli.py --ip 127.0.0.1 --port 49494 --format wav
 
 Commands:
     play [n]     play track n (default: current, starts at 1)
@@ -82,8 +85,13 @@ def make_tone_wav(frequency: float, duration_s: int, sample_rate: int = SAMPLE_R
 
 def make_tone_flac(frequency: float, duration_s: int) -> bytes:
     """FLAC encode a tone; FLAC is what the proxy normally serves."""
-    import numpy as np
-    import soundfile as sf
+    try:
+        import numpy as np
+        import soundfile as sf
+    except ImportError as e:
+        raise SystemExit(
+            "FLAC tones need numpy and soundfile: run `uv sync --extra local`, or pass --format wav"
+        ) from e
 
     t = np.arange(SAMPLE_RATE * duration_s) / SAMPLE_RATE
     fade = np.minimum(1.0, np.minimum(t, duration_s - t) * 50)
@@ -96,6 +104,15 @@ def make_tone_flac(frequency: float, duration_s: int) -> bytes:
 def parse_script(script: str) -> list[list[str]]:
     """Split "play 1; wait 2; next" into [["play", "1"], ["wait", "2"], ["next"]]."""
     return [shlex.split(part) for part in script.split(";") if part.strip()]
+
+
+def parse_line(line: str) -> Optional[list[str]]:
+    """Split one interactive line; None (after printing why) when it can't be parsed."""
+    try:
+        return shlex.split(line)
+    except ValueError as e:
+        print(f"! {e}")
+        return None
 
 
 def local_ip_for(target: str) -> str:
@@ -145,17 +162,23 @@ class ToneServer:
         if body is None:
             return web.Response(status=404)
         ctype = "audio/flac" if name.endswith(".flac") else "audio/wav"
-        start, end = 0, len(body) - 1
+        size = len(body)
+        start, end = 0, size - 1
         status = 200
         rng = request.headers.get("Range", "")
         if rng.startswith("bytes="):
             first, _, last = rng[6:].partition("-")
-            start = int(first or 0)
-            end = int(last) if last else end
+            if not first:
+                start = max(0, size - int(last or 0))
+            else:
+                start = int(first)
+                end = min(int(last), size - 1) if last else size - 1
+            if start >= size or start > end:
+                return web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
             status = 206
         headers = {"Accept-Ranges": "bytes", "Content-Type": ctype}
         if status == 206:
-            headers["Content-Range"] = f"bytes {start}-{end}/{len(body)}"
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         if request.method == "HEAD":
             headers["Content-Length"] = str(end - start + 1)
             return web.Response(status=status, headers=headers)
@@ -304,7 +327,7 @@ async def main() -> None:
             loop = asyncio.get_running_loop()
             while True:
                 line = await loop.run_in_executor(None, input, "dlna> ")
-                words = shlex.split(line)
+                words = parse_line(line)
                 if words and not await session.run(words):
                     break
     except (EOFError, KeyboardInterrupt):

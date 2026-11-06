@@ -47,7 +47,17 @@ def test_tone_flac_is_flac():
     assert dlna_cli.make_tone_flac(440.0, 1)[:4] == b"fLaC"
 
 
-async def test_tone_server_serves_ranges():
+@pytest.mark.parametrize(
+    ("header", "status", "body", "content_range"),
+    [
+        ("bytes=2-5", 206, b"2345", "bytes 2-5/10"),
+        ("bytes=7-", 206, b"789", "bytes 7-9/10"),
+        ("bytes=-3", 206, b"789", "bytes 7-9/10"),
+        ("bytes=8-99", 206, b"89", "bytes 8-9/10"),
+        ("bytes=10-", 416, b"", "bytes */10"),
+    ],
+)
+async def test_tone_server_serves_ranges(header, status, body, content_range):
     server = dlna_cli.ToneServer({"t.wav": b"0123456789"}, "127.0.0.1", 0)
     app = web.Application()
     app.router.add_route("*", "/{name}", server._handle)
@@ -55,12 +65,23 @@ async def test_tone_server_serves_ranges():
         from aiohttp import ClientSession
 
         async with ClientSession() as s:
-            async with s.get(ts.make_url("/t.wav"), headers={"Range": "bytes=2-5"}) as r:
-                assert r.status == 206
-                assert await r.read() == b"2345"
-                assert r.headers["Content-Range"] == "bytes 2-5/10"
+            async with s.get(ts.make_url("/t.wav"), headers={"Range": header}) as r:
+                assert r.status == status
+                assert await r.read() == body
+                assert r.headers["Content-Range"] == content_range
             async with s.get(ts.make_url("/missing.wav")) as r:
                 assert r.status == 404
+
+
+def test_parse_line_reports_unbalanced_quotes():
+    assert dlna_cli.parse_line('play "1') is None
+    assert dlna_cli.parse_line("play 2") == ["play", "2"]
+
+
+def test_flac_without_optional_deps_explains_the_fix(monkeypatch):
+    monkeypatch.setitem(sys.modules, "soundfile", None)
+    with pytest.raises(SystemExit, match="--format wav"):
+        dlna_cli.make_tone_flac(440.0, 1)
 
 
 @pytest.fixture
