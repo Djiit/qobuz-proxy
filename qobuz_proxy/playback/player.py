@@ -111,6 +111,9 @@ class QobuzPlayer:
         self._playback_lock = asyncio.Lock()
         self._command_generation = 0
         self._playback_permission_check: Optional[Callable[[], Awaitable[bool]]] = None
+        # Current item (track_id, queue_item_id, context_uuid) from a SET_STATE
+        # that has not been applied yet.
+        self._pending_remote_item: Optional[tuple[str, Optional[int], Optional[bytes]]] = None
 
         # State reporting - supports both callback and StateReporter
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
@@ -426,6 +429,7 @@ class QobuzPlayer:
         """Revoke queued/in-flight playback intents without interrupting current audio."""
         self._next_generation()
         self._clear_skip_pending()
+        self._pending_remote_item = None
 
     def set_playback_permission_check(self, check: Callable[[], Awaitable[bool]]) -> None:
         """Check renderer ownership before applying a remote session snapshot."""
@@ -485,6 +489,12 @@ class QobuzPlayer:
         # skip's pending play, leaving the renderer stopped (GitHub #33).
         if track_id is None and position_ms is None and playing_state is None:
             return
+        # The app can send a skip as two SET_STATEs: the new current item, then
+        # a bare playing state. The second supersedes the first while it is
+        # still waiting on the ownership check, so carry the unapplied item
+        # forward instead of losing the skip.
+        if track_id is None and self._pending_remote_item is not None:
+            track_id, queue_item_id, context_uuid = self._pending_remote_item
         # A replay of the failed current item is not a new playback intent.
         # In particular it must not invalidate a NEXT waiting for the send lock.
         pending = self._skip_pending_track
@@ -501,6 +511,8 @@ class QobuzPlayer:
             )
         ):
             return
+        if track_id is not None:
+            self._pending_remote_item = (track_id, queue_item_id, context_uuid)
         gen = self._next_generation()
         async with self._playback_lock:
             if gen != self._command_generation:
@@ -511,6 +523,8 @@ class QobuzPlayer:
                 return
             if gen != self._command_generation:
                 return
+            # This SET_STATE owns the item now; a later bare state must not replay it.
+            self._pending_remote_item = None
 
             # Detect a stale session-restore snapshot (server replays an old
             # PAUSED position after a reconnect while we're still playing). Done
