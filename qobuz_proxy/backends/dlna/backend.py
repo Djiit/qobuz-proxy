@@ -45,6 +45,9 @@ PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
 # interval plus renderers whose reported position lags a little.
 EARLY_STOP_MARGIN_MS = 15_000
 
+# CurrentURI a Bose SoundTouch reports once nothing plays.
+SOUNDTOUCH_IDLE_SCHEME = "qplay:"
+
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
 
@@ -217,9 +220,9 @@ class DLNABackend(AudioBackend):
         URL too) and at the natural end of a track (TrackURI keeps our URL).
         A skip (Stop, then Play) and an auto-advance both pass through that
         state. Nothing plays there, so it is not a takeover; it only becomes
-        one once another source actually plays.
+        one once another source actually plays. Any other URI fails closed.
         """
-        if self._is_sonos or not self._client:
+        if self._is_sonos or not self._client or not observed.startswith(SOUNDTOUCH_IDLE_SCHEME):
             return False
         transport = await self._client.get_transport_info()
         if not transport or transport in ("PLAYING", "TRANSITIONING"):
@@ -227,14 +230,13 @@ class DLNABackend(AudioBackend):
         stopped_by_us = self._last_stop_at is not None
         if not stopped_by_us:
             track_uri = await self._client.get_track_uri()
-            if track_uri not in (expected, self._next_track_proxy_url):
+            if not track_uri or track_uri not in (expected, self._next_track_proxy_url):
                 return False
         if (
             self._external_playback
             or self._starting_playback
             or self._stopping_playback
             or expected != self._current_proxy_url
-            or (stopped_by_us and self._last_stop_at is None)
         ):
             return False
         logger.debug(

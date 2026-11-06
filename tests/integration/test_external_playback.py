@@ -520,6 +520,32 @@ async def test_foreign_source_playing_with_stale_track_uri_is_a_takeover(rig):
     assert not manager.is_renderer_active
 
 
+@pytest.mark.parametrize("transport", ["PAUSED_PLAYBACK", "STOPPED"])
+async def test_foreign_source_paused_after_our_stop_is_a_takeover(rig, transport):
+    """After our Stop only the standby placeholder is ours. Spotify or AirPlay
+    paused on the speaker must still fail closed."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop()
+    client.get_media_info.return_value = SPOTIFY_URI
+    client.get_track_uri.return_value = SPOTIFY_URI
+    client.get_transport_info.return_value = transport
+    assert not await backend.can_apply_remote_state()
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
+async def test_failed_track_uri_read_does_not_hide_a_takeover(rig):
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    client.get_media_info.return_value = SPOTIFY_URI
+    client.get_track_uri.return_value = None
+    client.get_transport_info.return_value = "STOPPED"
+    assert not await backend.can_apply_remote_state()
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
 async def test_idle_placeholder_without_our_stop_is_a_takeover(rig):
     """Only our own Stop explains the renderer dropping our track."""
     backend, client, _, manager, _ = rig
