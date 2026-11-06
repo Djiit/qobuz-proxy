@@ -166,7 +166,8 @@ class DLNABackend(AudioBackend):
 
     async def can_apply_remote_state(self) -> bool:
         """Require source confirmation for snapshots of an already loaded transport."""
-        if not self._current_proxy_url:
+        expected = self._current_proxy_url
+        if not expected:
             return not self._external_playback
         if await self._owns_transport():
             return True
@@ -183,8 +184,12 @@ class DLNABackend(AudioBackend):
             or not self._client
         ):
             return False
-        if await self._client.get_media_info() != "":
+        media_uri = await self._client.get_media_info()
+        if media_uri is None:
             return False
+        if media_uri != "":
+            # SoundTouch idles on a placeholder URI instead of clearing it.
+            return await self._idle_after_our_stop(expected, media_uri)
         return await self._client.get_transport_info() in ("STOPPED", "NO_MEDIA_PRESENT")
 
     async def _read_current_uri(self) -> Optional[str]:
@@ -203,6 +208,43 @@ class DLNABackend(AudioBackend):
         if media_uri != "":
             return media_uri
         return await self._client.get_track_uri() or media_uri
+
+    async def _idle_after_our_stop(self, expected: str, observed: str) -> bool:
+        """Whether a foreign URI only means the renderer went idle on our track.
+
+        Bose SoundTouch swaps CurrentURI to a standby placeholder (qplay://)
+        whenever playback stops: after our own Stop (TrackURI becomes a dummy
+        URL too) and at the natural end of a track (TrackURI keeps our URL).
+        A skip (Stop, then Play) and an auto-advance both pass through that
+        state. Nothing plays there, so it is not a takeover; it only becomes
+        one once another source actually plays.
+        """
+        if self._is_sonos or not self._client:
+            return False
+        transport = await self._client.get_transport_info()
+        if not transport or transport in ("PLAYING", "TRANSITIONING"):
+            return False
+        stopped_by_us = self._last_stop_at is not None
+        if not stopped_by_us:
+            track_uri = await self._client.get_track_uri()
+            if track_uri not in (expected, self._next_track_proxy_url):
+                return False
+        if (
+            self._external_playback
+            or self._starting_playback
+            or self._stopping_playback
+            or expected != self._current_proxy_url
+            or (stopped_by_us and self._last_stop_at is None)
+        ):
+            return False
+        logger.debug(
+            "[%s] Renderer idles on %s after %s (%s); not a takeover",
+            self.name,
+            _source_label(observed),
+            "our Stop" if stopped_by_us else "the end of our track",
+            transport,
+        )
+        return True
 
     async def _owns_transport(self) -> bool:
         """Only control the current or armed Qobuz track; unknown sources fail closed."""
@@ -253,6 +295,8 @@ class DLNABackend(AudioBackend):
                 return True
         # Renderers can briefly report the old source while loading our URI.
         if time.monotonic() - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS:
+            return False
+        if await self._idle_after_our_stop(expected, current_uri):
             return False
         logger.warning(
             "[%s] Source mismatch: observed=%s expected=%s armed_at_read=%s armed_now=%s "

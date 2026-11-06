@@ -426,6 +426,111 @@ async def test_deactivation_stops_renderer_without_media_uri(rig):
     assert player.state == PlaybackState.STOPPED
 
 
+SOUNDTOUCH_IDLE_URI = "qplay://"
+SOUNDTOUCH_IDLE_TRACK_URI = "http://invalidHost.com/invalidUri.mp3"
+
+
+def _soundtouch(rig_backend, client):
+    """Bose SoundTouch: empty CurrentURI while playing; after Stop it drops to a
+    standby placeholder (CurrentURI qplay://, PAUSED_PLAYBACK)."""
+    rig_backend._is_sonos = False
+    rig_backend._next_track_proxy_url = None
+    rig_backend._playback_started_at = 0
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = QOBUZ_URI
+    client.get_transport_info.return_value = "PLAYING"
+
+    async def stop():
+        client.get_media_info.return_value = SOUNDTOUCH_IDLE_URI
+        client.get_track_uri.return_value = SOUNDTOUCH_IDLE_TRACK_URI
+        client.get_transport_info.return_value = "PAUSED_PLAYBACK"
+        return True
+
+    client.stop.side_effect = stop
+
+
+async def test_skip_on_renderer_idling_after_our_stop_keeps_the_session(rig):
+    """A skip is Stop + Play. The SoundTouch shows its standby placeholder in
+    between; that is not another source, so the proxy must play the next track
+    instead of leaving the Qobuz session ("device disconnected")."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop(next_track_id="456")
+    metadata = BackendTrackMetadata(track_id="456", title="Next", artist="Artist")
+    await backend.play(NEXT_URI, metadata)
+    client.set_av_transport_uri.assert_awaited_once()
+    assert backend._current_proxy_url == NEXT_URI
+    assert not backend._external_playback
+    assert manager.is_renderer_active
+
+
+async def test_poll_after_our_stop_does_not_release_idle_renderer(rig):
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop()
+    assert not await backend.check_external_playback()
+    assert manager.is_renderer_active
+    # The app may start a new track on the stopped speaker.
+    assert await backend.can_apply_remote_state()
+
+
+async def test_idle_placeholder_after_our_stop_is_still_not_controllable(rig):
+    backend, client, _, _, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop()
+    client.pause.reset_mock()
+    await backend.pause()
+    client.pause.assert_not_awaited()
+
+
+@pytest.mark.parametrize("transport", ["PLAYING", "TRANSITIONING"])
+async def test_foreign_source_playing_after_our_stop_is_a_takeover(rig, transport):
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop()
+    client.get_media_info.return_value = SPOTIFY_URI
+    client.get_transport_info.return_value = transport
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
+async def test_natural_track_end_on_soundtouch_is_not_a_takeover(rig):
+    """At the end of a track the SoundTouch reports STOPPED with CurrentURI
+    qplay:// but keeps our URI in TrackURI; the queue must advance."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    client.get_media_info.return_value = SOUNDTOUCH_IDLE_URI
+    client.get_track_uri.return_value = QOBUZ_URI
+    client.get_transport_info.return_value = "STOPPED"
+    assert not await backend.check_external_playback()
+    assert manager.is_renderer_active
+    assert await backend.can_apply_remote_state()
+    metadata = BackendTrackMetadata(track_id="456", title="Next", artist="Artist")
+    await backend.play(NEXT_URI, metadata)
+    client.set_av_transport_uri.assert_awaited_once()
+
+
+async def test_foreign_source_playing_with_stale_track_uri_is_a_takeover(rig):
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    client.get_media_info.return_value = SPOTIFY_URI
+    client.get_track_uri.return_value = QOBUZ_URI
+    client.get_transport_info.return_value = "PLAYING"
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
+async def test_idle_placeholder_without_our_stop_is_a_takeover(rig):
+    """Only our own Stop explains the renderer dropping our track."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    client.get_media_info.return_value = SOUNDTOUCH_IDLE_URI
+    client.get_track_uri.return_value = SOUNDTOUCH_IDLE_TRACK_URI
+    client.get_transport_info.return_value = "PAUSED_PLAYBACK"
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
 @pytest.mark.parametrize("uri", [None, ""])
 async def test_unknown_source_blocks_snapshot_without_relinquishing_session(rig, uri):
     backend, client, player, manager, tasks = rig

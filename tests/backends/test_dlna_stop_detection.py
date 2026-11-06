@@ -119,6 +119,16 @@ async def test_gapless_transition_without_media_uri_uses_track_uri(backend, monk
     assert backend._next_track_proxy_url is None
 
 
+async def test_soundtouch_track_end_advances(backend, monkeypatch):
+    """SoundTouch swaps CurrentURI to qplay:// at the end of a track."""
+    backend._furthest_position_ms = 198_000
+    backend._client.get_media_info.return_value = "qplay://"
+    backend._client.get_track_uri.return_value = QOBUZ_URI
+    await poll(backend, monkeypatch)
+    assert not backend._external_playback
+    backend.ended.assert_called_once()
+
+
 async def test_new_play_forgets_an_earlier_failure_of_the_same_track(backend):
     backend._on_delivery_failure("123", True)
     proxy = MagicMock()
