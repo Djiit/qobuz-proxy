@@ -71,10 +71,14 @@ class PlaybackCommandHandler:
         self._active = False
         self._generation = 0
         self._deactivation_generation: Optional[int] = None
+        # The first SET_STATE after a (re)connect/activation is the server's
+        # session-restore snapshot; its position can lag the renderer.
+        self._snapshot_pending = False
 
     def note_connected(self) -> None:
         """Wait for explicit server activation on each new connection."""
         self.note_disconnected()
+        self._snapshot_pending = True
 
     def note_disconnected(self) -> None:
         """Invalidate commands from the old connection without stopping current audio."""
@@ -88,6 +92,7 @@ class PlaybackCommandHandler:
             self._generation += 1
             self.player.invalidate_pending_commands()
         if active:
+            self._snapshot_pending = True
             self._deactivation_generation = None
         else:
             self._deactivation_generation = self._generation
@@ -169,9 +174,13 @@ class PlaybackCommandHandler:
         if not self._active:
             logger.debug("[%s] Ignoring SET_STATE: renderer is not active", self._speaker_name)
             return
-        await self._apply_set_state(state, self._generation)
+        session_snapshot = self._snapshot_pending
+        self._snapshot_pending = False
+        await self._apply_set_state(state, self._generation, session_snapshot=session_snapshot)
 
-    async def _apply_set_state(self, state: Any, generation: int) -> None:
+    async def _apply_set_state(
+        self, state: Any, generation: int, session_snapshot: bool = False
+    ) -> None:
         """Apply a decoded SrvrRndrSetState while this renderer still owns playback."""
         # Renderer-only connections do not receive controller queue snapshots.
         # Their reports must echo the version supplied in SET_STATE; otherwise
@@ -268,6 +277,7 @@ class PlaybackCommandHandler:
             position_ms=state.currentPosition if state.HasField("currentPosition") else None,
             playing_state=state.playingState if state.HasField("playingState") else None,
             context_uuid=current_context_uuid,
+            session_snapshot=session_snapshot,
         )
 
         # Notify gapless system about next track change (after state handling)

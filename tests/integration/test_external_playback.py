@@ -557,6 +557,51 @@ async def test_idle_placeholder_without_our_stop_is_a_takeover(rig):
     assert not manager.is_renderer_active
 
 
+async def test_idle_placeholder_after_our_pause_is_not_a_takeover(rig):
+    """We paused, then the SoundTouch dropped to its standby placeholder
+    (CurrentURI qplay://, TrackURI the invalidHost dummy) — Wi-Fi standby or a
+    reboot while paused. The placeholder is still ours: keep the session and
+    allow the app to load onto the speaker again."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.pause()
+    client.get_media_info.return_value = SOUNDTOUCH_IDLE_URI
+    client.get_track_uri.return_value = SOUNDTOUCH_IDLE_TRACK_URI
+    client.get_transport_info.return_value = "PAUSED_PLAYBACK"
+    assert not await backend.check_external_playback()
+    assert manager.is_renderer_active
+    assert await backend.can_apply_remote_state()
+
+
+async def test_foreign_source_paused_after_our_pause_is_still_a_takeover(rig):
+    """After our Pause a foreign source paused on the speaker still fails
+    closed — it reports its own URI, not the qplay:// placeholder."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.pause()
+    client.get_media_info.return_value = SPOTIFY_URI
+    client.get_track_uri.return_value = SPOTIFY_URI
+    client.get_transport_info.return_value = "PAUSED_PLAYBACK"
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
+async def test_resume_clears_the_pause_marker(rig):
+    """Once we play again, a later standby placeholder is no longer explained
+    by our pause."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.pause()
+    metadata = BackendTrackMetadata(track_id="456", title="Next", artist="Artist")
+    await backend.play(NEXT_URI, metadata)
+    backend._playback_started_at = 0  # past the start grace period
+    client.get_media_info.return_value = SOUNDTOUCH_IDLE_URI
+    client.get_track_uri.return_value = SOUNDTOUCH_IDLE_TRACK_URI
+    client.get_transport_info.return_value = "PAUSED_PLAYBACK"
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
 @pytest.mark.parametrize("uri", [None, ""])
 async def test_unknown_source_blocks_snapshot_without_relinquishing_session(rig, uri):
     backend, client, player, manager, tasks = rig
