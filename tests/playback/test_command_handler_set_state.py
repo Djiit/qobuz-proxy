@@ -7,6 +7,7 @@ sequence to player.apply_remote_state(), which applies it atomically.
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -484,3 +485,64 @@ class TestRendererOwnership:
         handler.note_disconnected()
         await stop
         assert player.state == PlaybackState.PLAYING
+
+
+class TestSessionSnapshotSeek:
+    """The first SET_STATE after a (re)connect is the server's session-restore
+    snapshot. Its currentPosition can lag the renderer by several seconds, and
+    seeking the renderer backward to it tears down and re-buffers the stream
+    (audible glitch on every re-selection). A live command later must still
+    seek, including backward."""
+
+    async def _playing_player(self):
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await player.play_track(queue_item_id=1, track_id="2001", position_ms=0)
+        player._current_duration_ms = 340_000
+        player._set_position(138_000)
+        backend.seek = AsyncMock()
+        # Consume the activation snapshot slot: the first SET_STATE after an
+        # activation is the session-restore snapshot, not a live command.
+        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
+        backend.seek.reset_mock()
+        return player, backend, handler
+
+    async def test_reconnect_snapshot_does_not_seek_backward(self) -> None:
+        player, backend, handler = await self._playing_player()
+        handler.note_connected()
+        await handler._handle_set_active(_set_active_msg(True))
+
+        await handler._handle_set_state(
+            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=2, position_ms=129_213)
+        )
+
+        backend.seek.assert_not_awaited()
+        assert player.state == PlaybackState.PLAYING
+        assert player.current_position_ms >= 138_000
+
+    async def test_live_playing_seek_backward_still_applies(self) -> None:
+        """Without a fresh connect/activation the same message is a real user
+        scrub and must seek."""
+        player, backend, handler = await self._playing_player()
+
+        await handler._handle_set_state(
+            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=2, position_ms=129_213)
+        )
+
+        backend.seek.assert_awaited_with(129_213)
+
+    async def test_only_the_first_set_state_after_reconnect_is_a_snapshot(self) -> None:
+        player, backend, handler = await self._playing_player()
+        handler.note_connected()
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(
+            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=2, position_ms=129_213)
+        )
+        backend.seek.assert_not_awaited()
+
+        # A second, live SET_STATE with a lower position is a real scrub.
+        await handler._handle_set_state(
+            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=2, position_ms=100_000)
+        )
+        backend.seek.assert_awaited_with(100_000)

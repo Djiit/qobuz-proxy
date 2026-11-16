@@ -462,6 +462,7 @@ class QobuzPlayer:
         position_ms: Optional[int],
         playing_state: Optional[int],
         context_uuid: Optional[bytes] = None,
+        session_snapshot: bool = False,
     ) -> None:
         """Apply a full SET_STATE intent from the app atomically.
 
@@ -481,6 +482,9 @@ class QobuzPlayer:
                 or None if the message had no playingState.
             context_uuid: Album/playlist context bytes for the target track, used
                 for play reporting (listening history / scrobbles).
+            session_snapshot: True when this is the first SET_STATE after a
+                (re)connect/activation — the server's session-restore replay,
+                whose position can lag the renderer.
         """
         # A SET_STATE that only updates the queue version or next item carries
         # no playback intent. It must not supersede a track change still being
@@ -527,10 +531,12 @@ class QobuzPlayer:
             self._pending_remote_item = None
 
             # Detect a stale session-restore snapshot (server replays an old
-            # PAUSED position after a reconnect while we're still playing). Done
+            # position after a reconnect while we're still playing). Done
             # before any mutation so a replayed snapshot can't overwrite live
             # state (position or context) with its outdated values.
             stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
+            if not stale and session_snapshot:
+                stale = self._is_stale_playing_snapshot_locked(track_id, position_ms)
 
             if (
                 self._skip_pending_track is not None
@@ -719,6 +725,42 @@ class QobuzPlayer:
             "Ignoring stale SET_STATE: server says PAUSED at %dms, renderer is "
             "PLAYING at %dms (%.1fs ahead) on same track — likely a session-"
             "restore replay after WebSocket reconnect; keeping playback.",
+            position_ms,
+            actual_pos,
+            gap_ms / 1000.0,
+        )
+        return True
+
+    def _is_stale_playing_snapshot_locked(
+        self,
+        track_id: Optional[str],
+        position_ms: Optional[int],
+    ) -> bool:
+        """Whether the session-restore snapshot's position lags the renderer.
+
+        Only consulted for the first SET_STATE after a (re)connect/activation,
+        where the server replays its last-known PLAYING position. If the
+        renderer is actually playing the same track further ahead, seeking back
+        to the stale position would tear down and re-buffer the stream, so the
+        snapshot's seek is dropped and playback continues at the real position.
+        Live SET_STATEs (user scrubs) are not snapshots and always seek.
+        """
+        if self._state != PlaybackState.PLAYING:
+            return False
+        if position_ms is None:
+            return False
+        cur = self._current_track
+        if track_id is not None and (cur is None or cur.track_id != track_id):
+            return False
+
+        actual_pos = self.current_position_ms
+        gap_ms = actual_pos - position_ms
+        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS:
+            return False
+
+        logger.info(
+            "Ignoring stale snapshot position: server replay says %dms, renderer is "
+            "PLAYING at %dms (%.1fs ahead) on same track — keeping playback position.",
             position_ms,
             actual_pos,
             gap_ms / 1000.0,

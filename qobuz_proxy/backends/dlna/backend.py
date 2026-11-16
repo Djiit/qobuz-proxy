@@ -48,6 +48,9 @@ EARLY_STOP_MARGIN_MS = 15_000
 # CurrentURI a Bose SoundTouch reports once nothing plays.
 SOUNDTOUCH_IDLE_SCHEME = "qplay:"
 
+# TrackURI the same SoundTouch reports while in that standby state.
+SOUNDTOUCH_IDLE_TRACK_URI = "http://invalidHost.com/invalidUri.mp3"
+
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
 
@@ -150,6 +153,7 @@ class DLNABackend(AudioBackend):
         self._starting_playback = False
         self._stopping_playback = False
         self._last_stop_at: Optional[float] = None
+        self._last_pause_at: Optional[float] = None
         self._on_external_playback: Optional[Callable[[], Awaitable[None]]] = None
 
     def on_external_playback(self, callback: Callable[[], Awaitable[None]]) -> None:
@@ -217,7 +221,8 @@ class DLNABackend(AudioBackend):
 
         Bose SoundTouch swaps CurrentURI to a standby placeholder (qplay://)
         whenever playback stops: after our own Stop (TrackURI becomes a dummy
-        URL too) and at the natural end of a track (TrackURI keeps our URL).
+        URL too), after our own Pause once the box enters standby (same dummy
+        TrackURI), and at the natural end of a track (TrackURI keeps our URL).
         A skip (Stop, then Play) and an auto-advance both pass through that
         state. Nothing plays there, so it is not a takeover; it only becomes
         one once another source actually plays. Any other URI fails closed.
@@ -228,10 +233,14 @@ class DLNABackend(AudioBackend):
         if not transport or transport in ("PLAYING", "TRANSITIONING"):
             return False
         stopped_by_us = self._last_stop_at is not None
+        paused_by_us = self._last_pause_at is not None
         if not stopped_by_us:
             track_uri = await self._client.get_track_uri()
             if not track_uri or track_uri not in (expected, self._next_track_proxy_url):
-                return False
+                # After our own Pause the SoundTouch also drops TrackURI to its
+                # standby dummy; that placeholder is still our idle state.
+                if not (paused_by_us and track_uri == SOUNDTOUCH_IDLE_TRACK_URI):
+                    return False
         if (
             self._external_playback
             or self._starting_playback
@@ -243,7 +252,9 @@ class DLNABackend(AudioBackend):
             "[%s] Renderer idles on %s after %s (%s); not a takeover",
             self.name,
             _source_label(observed),
-            "our Stop" if stopped_by_us else "the end of our track",
+            "our Stop"
+            if stopped_by_us
+            else ("our Pause" if paused_by_us else "the end of our track"),
             transport,
         )
         return True
@@ -489,6 +500,7 @@ class DLNABackend(AudioBackend):
         if success:
             self._external_playback = False
             self._last_stop_at = None
+            self._last_pause_at = None
             self._position_ms = 0
             self._furthest_position_ms = 0
             self._current_proxy_url = actual_url
@@ -563,6 +575,7 @@ class DLNABackend(AudioBackend):
     async def pause(self) -> None:
         """Pause playback."""
         if self._client and await self._owns_transport() and await self._client.pause():
+            self._last_pause_at = time.monotonic()
             self._notify_state_change(PlaybackState.PAUSED)
 
     async def resume(self) -> bool:
