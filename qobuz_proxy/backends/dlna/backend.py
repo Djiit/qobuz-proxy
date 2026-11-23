@@ -510,8 +510,14 @@ class DLNABackend(AudioBackend):
         else:
             success = await self._play_via_transport(actual_url, didl)
 
+        # Qobuz was released during the load; nothing would control this track.
+        if self._external_playback:
+            if self._client and await self._read_current_uri() == actual_url:
+                await self._client.stop()
+                logger.info("[%s] Stopped track loaded after Qobuz was released", self.name)
+            raise RuntimeError("External source owns renderer; select it again in Qobuz")
+
         if success:
-            self._external_playback = False
             self._last_stop_at = None
             self._last_pause_at = None
             self._position_ms = 0
