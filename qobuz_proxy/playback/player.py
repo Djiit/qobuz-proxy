@@ -114,6 +114,7 @@ class QobuzPlayer:
         # Current item (track_id, queue_item_id, context_uuid) from a SET_STATE
         # that has not been applied yet.
         self._pending_remote_item: Optional[tuple[str, Optional[int], Optional[bytes]]] = None
+        self._pending_remote_position: Optional[int] = None
 
         # State reporting - supports both callback and StateReporter
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
@@ -430,6 +431,7 @@ class QobuzPlayer:
         self._next_generation()
         self._clear_skip_pending()
         self._pending_remote_item = None
+        self._pending_remote_position = None
 
     def set_playback_permission_check(self, check: Callable[[], Awaitable[bool]]) -> None:
         """Check renderer ownership before applying a remote session snapshot."""
@@ -496,7 +498,9 @@ class QobuzPlayer:
         # The app can send a skip as two SET_STATEs: the new current item, then
         # a bare playing state. The second supersedes the first while it is
         # still waiting on the ownership check, so carry the unapplied item
-        # forward instead of losing the skip.
+        # forward instead of losing the skip. "Restart track" is split the same
+        # way: a position, then a bare PLAYING.
+        carry_position = track_id is None and position_ms is None and playing_state == 2
         if track_id is None and self._pending_remote_item is not None:
             track_id, queue_item_id, context_uuid = self._pending_remote_item
         # A replay of the failed current item is not a new playback intent.
@@ -517,6 +521,13 @@ class QobuzPlayer:
             return
         if track_id is not None:
             self._pending_remote_item = (track_id, queue_item_id, context_uuid)
+        if carry_position:
+            position_ms = self._pending_remote_position
+        elif playing_state is None and not session_snapshot:
+            self._pending_remote_position = position_ms
+        else:
+            # Snapshot positions can lag the renderer; never replay them.
+            self._pending_remote_position = None
         gen = self._next_generation()
         async with self._playback_lock:
             if gen != self._command_generation:
@@ -529,6 +540,7 @@ class QobuzPlayer:
                 return
             # This SET_STATE owns the item now; a later bare state must not replay it.
             self._pending_remote_item = None
+            self._pending_remote_position = None
 
             # Detect a stale session-restore snapshot (server replays an old
             # position after a reconnect while we're still playing). Done

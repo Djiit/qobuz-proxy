@@ -546,3 +546,124 @@ class TestSessionSnapshotSeek:
             _set_state_msg(track_id=2001, queue_item_id=1, playing_state=2, position_ms=100_000)
         )
         backend.seek.assert_awaited_with(100_000)
+
+
+def _position_only_msg(position_ms: int):
+    """SET_STATE carrying only a position, no item or playing state."""
+    msg = pb.QConnectMessage()
+    msg.messageType = 41
+    msg.srvrRndrSetState.currentPosition = position_ms
+    return msg
+
+
+class TestSplitSeek:
+    """The Android app's "restart track" reaches the renderer as two SET_STATE
+    messages ~70 ms apart: currentPosition 0, then a bare PLAYING. The second
+    must not cancel the seek while the first is still being applied."""
+
+    async def _playing_player(self):
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await player.play_track(queue_item_id=1, track_id="2001", position_ms=0)
+        player._current_duration_ms = 340_000
+        player._set_position(36_000)
+        backend.seek = AsyncMock()
+        # Consume the activation snapshot slot.
+        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
+        backend.seek.reset_mock()
+        return player, backend, handler
+
+    async def _superseded_during_check(self, player, handler, first, second) -> None:
+        checking = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_permission_check() -> bool:
+            # The DLNA ownership check is a SOAP round trip to the speaker.
+            checking.set()
+            await release.wait()
+            return True
+
+        player.set_playback_permission_check(slow_permission_check)
+        first_task = asyncio.create_task(handler._handle_set_state(first))
+        await checking.wait()
+        second_task = asyncio.create_task(handler._handle_set_state(second))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first_task, second_task)
+
+    async def test_bare_play_does_not_cancel_a_pending_restart(self) -> None:
+        player, backend, handler = await self._playing_player()
+
+        await self._superseded_during_check(
+            player, handler, _position_only_msg(0), _playing_state_only_msg(2)
+        )
+
+        backend.seek.assert_awaited_once_with(0)
+        assert player.state == PlaybackState.PLAYING
+        assert player.current_position_ms < 36_000
+
+    async def test_pending_position_is_not_applied_to_a_new_track(self) -> None:
+        player, backend, handler = await self._playing_player()
+
+        await self._superseded_during_check(
+            player,
+            handler,
+            _position_only_msg(30_000),
+            _set_state_msg(track_id=1002, queue_item_id=2),
+        )
+
+        backend.seek.assert_not_awaited()
+        assert player.current_track is not None
+        assert player.current_track.track_id == "1002"
+
+    async def test_pause_does_not_take_a_pending_position(self) -> None:
+        player, backend, handler = await self._playing_player()
+
+        await self._superseded_during_check(
+            player, handler, _position_only_msg(0), _playing_state_only_msg(3)
+        )
+
+        backend.seek.assert_not_awaited()
+        assert player.state == PlaybackState.PAUSED
+
+    async def test_reconnect_snapshot_position_is_not_carried(self) -> None:
+        player, backend, handler = await self._playing_player()
+        player._set_position(138_000)
+        handler.note_connected()
+        await handler._handle_set_active(_set_active_msg(True))
+
+        await self._superseded_during_check(
+            player,
+            handler,
+            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=2, position_ms=129_213),
+            _playing_state_only_msg(2),
+        )
+
+        backend.seek.assert_not_awaited()
+        assert player.state == PlaybackState.PLAYING
+
+    async def test_paused_position_is_not_carried(self) -> None:
+        player, backend, handler = await self._playing_player()
+
+        await self._superseded_during_check(
+            player,
+            handler,
+            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=3, position_ms=0),
+            _playing_state_only_msg(2),
+        )
+
+        backend.seek.assert_not_awaited()
+        assert player.state == PlaybackState.PLAYING
+
+    async def test_applied_seek_is_not_replayed_by_later_bare_play(self) -> None:
+        player, backend, handler = await self._playing_player()
+        await handler._handle_set_state(_position_only_msg(0))
+        backend.seek.assert_awaited_once_with(0)
+        player._set_position(20_000)
+
+        await handler._handle_set_state(_playing_state_only_msg(3))
+        await handler._handle_set_state(_playing_state_only_msg(2))
+
+        backend.seek.assert_awaited_once_with(0)
