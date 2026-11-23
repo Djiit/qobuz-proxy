@@ -37,6 +37,8 @@ class QConnectProto(IntEnum):
 class QConnectMessageType(IntEnum):
     """Inner QConnect message types (subset of commonly used)."""
 
+    ERROR = 1
+
     # Renderer -> Server
     RNDR_SRVR_JOIN_SESSION = 21
     RNDR_SRVR_DEVICE_INFO_UPDATED = 22

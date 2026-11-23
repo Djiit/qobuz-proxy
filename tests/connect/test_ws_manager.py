@@ -840,3 +840,119 @@ async def test_reselection_waits_for_released_socket_cleanup(ws_manager, valid_t
     finally:
         finish_close.set()
         await ws_manager.stop()
+
+
+STALE_SESSION = "e8eaa116-b5d1-4e24-be89-fce59a93f791"
+APP_SESSION = "77382197-caba-4329-b4b3-a72f469404c8"
+
+
+def _disconnect_frame() -> bytes:
+    from qobuz_proxy.connect.protocol import MessageType, ProtocolCodec
+
+    return ProtocolCodec(bytes(16))._pack_frame(MessageType.DISCONNECT, b"")
+
+
+def _mismatch_message(expected: str, sent: str) -> str:
+    # Shape of the server text recorded on a live speaker.
+    return f"sessionUuid mismatch [userData.sessionUuid: {expected}, message.sessionUuid: {sent}]"
+
+
+def _error_frame(code: str, message: str) -> bytes:
+    from qobuz_proxy.connect.protocol import ProtocolCodec
+    from qobuz_proxy.proto import qconnect_payload_pb2 as pb
+
+    batch = pb.QConnectBatch()
+    error = batch.messages.add(messageType=1).error
+    error.code = code
+    error.message = message
+    return ProtocolCodec(bytes(16)).encode_payload(batch.SerializeToString())
+
+
+def _joins(manager: WsManager, connection: AsyncMock) -> list:
+    """(subscribed session, JOIN_SESSION message) for each join sent."""
+    from qobuz_proxy.connect.protocol import MessageType
+    from qobuz_proxy.proto import envelope as envelope_pb2
+
+    joins = []
+    subscribed = b""
+    for call in connection.send.call_args_list:
+        frame = call.args[0]
+        if frame[0] == MessageType.SUBSCRIBE:
+            _, offset = manager._codec._decode_varint(frame, 1)
+            subscribe = envelope_pb2.Subscribe()
+            subscribe.ParseFromString(frame[offset:])
+            subscribed = subscribe.channels[0]
+        elif frame[0] == MessageType.PAYLOAD:
+            decoded = manager._codec.decode_frame(frame)
+            message = manager._codec.decode_qconnect_batch(decoded.payload).messages[0]
+            if message.messageType == 21:
+                joins.append((subscribed, message.rndrSrvrJoinSession))
+    return joins
+
+
+class TestSessionMismatch:
+    """A self-minted token can belong to a newer app session than the stored one."""
+
+    @pytest.fixture
+    def rig(self, ws_manager, valid_tokens, monkeypatch):
+        valid_tokens.session_id = STALE_SESSION
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        connection = AsyncMock()
+        context = AsyncMock()
+        context.__aenter__.return_value = connection
+        monkeypatch.setattr(
+            "qobuz_proxy.connect.ws_manager.websockets.connect", MagicMock(return_value=context)
+        )
+        protocol_errors = MagicMock()
+        ws_manager.register_handler(1, protocol_errors)
+        return ws_manager, connection, protocol_errors
+
+    @staticmethod
+    async def _connect(manager: WsManager, connection: AsyncMock, *frames: bytes) -> None:
+        connection.recv.side_effect = [*frames, _disconnect_frame()]
+        await manager._connect_and_run()
+
+    async def test_rejoins_the_session_the_server_expects(self, rig):
+        manager, connection, protocol_errors = rig
+        mismatch = _error_frame("1001", _mismatch_message(APP_SESSION, STALE_SESSION))
+
+        await self._connect(manager, connection, mismatch)
+        await self._connect(manager, connection)
+
+        stale, app = uuid.UUID(STALE_SESSION).bytes, uuid.UUID(APP_SESSION).bytes
+        joins = _joins(manager, connection)
+        assert [(sub, join.sessionUuid) for sub, join in joins] == [(stale, stale), (app, app)]
+        assert joins[-1][1].isActive is False
+        protocol_errors.assert_called_once()
+
+    async def test_adopted_session_does_not_inherit_ownership(self, rig):
+        manager, connection, _ = rig
+        manager._renderer_active = True
+        mismatch = _error_frame("1001", _mismatch_message(APP_SESSION, STALE_SESSION))
+
+        await self._connect(manager, connection, mismatch)
+        await self._connect(manager, connection)
+
+        joins = _joins(manager, connection)
+        assert [join.isActive for _, join in joins] == [True, False]
+
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            # A rejection of a session we did not join says nothing about ours.
+            ("1001", _mismatch_message(APP_SESSION, str(uuid.uuid4()))),
+            ("1001", _mismatch_message("not-a-uuid", STALE_SESSION)),
+            ("1001", "sessionUuid mismatch"),
+            ("1003", _mismatch_message(APP_SESSION, STALE_SESSION)),
+        ],
+    )
+    async def test_keeps_session_on_unrecognized_error(self, rig, code, message):
+        manager, connection, _ = rig
+
+        await self._connect(manager, connection, _error_frame(code, message))
+        await self._connect(manager, connection)
+
+        stale = uuid.UUID(STALE_SESSION).bytes
+        joins = _joins(manager, connection)
+        assert [(sub, join.sessionUuid) for sub, join in joins] == [(stale, stale)] * 2
