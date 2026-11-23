@@ -6,6 +6,7 @@ Handles connection lifecycle, authentication, and message routing.
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -39,6 +40,13 @@ INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
 TOKEN_MINT_RETRY_DELAY = 30.0  # seconds between self-mint attempts
+
+SESSION_MISMATCH_ERROR_CODE = "1001"
+_UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+SESSION_MISMATCH_PATTERN = re.compile(
+    rf"sessionUuid mismatch \[userData\.sessionUuid: ({_UUID_PATTERN}), "
+    rf"message\.sessionUuid: ({_UUID_PATTERN})\]"
+)
 
 # Message handler callback type
 MessageHandler = Callable[[int, Any], Optional[asyncio.Task[None]]]
@@ -685,6 +693,8 @@ class WsManager:
                 logger.info(
                     "[%s] Renderer set active: %s", self.config.device.name, self._renderer_active
                 )
+            elif msg_type == QConnectMessageType.ERROR and msg.HasField("error"):
+                self._adopt_expected_session(msg.error.code, msg.error.message)
             handler = self._handlers.get(msg_type)
             if handler:
                 self._last_activity_time = time.monotonic()
@@ -694,6 +704,31 @@ class WsManager:
                     logger.error(f"Handler error for type {msg_type}: {e}")
             else:
                 logger.debug(f"No handler for message type {msg_type}")
+
+    def _adopt_expected_session(self, code: str, message: str) -> None:
+        """Rejoin the session the server expects after it rejects ours.
+
+        A self-minted token carries the user's current app session, which can
+        be newer than the one the app last handed to this renderer.
+        """
+        if code != SESSION_MISMATCH_ERROR_CODE:
+            return
+        match = SESSION_MISMATCH_PATTERN.search(message)
+        if not match:
+            return
+        expected, rejected = (uuid.UUID(value).bytes for value in match.groups())
+        # A rejection of any other session says nothing about ours.
+        if rejected != self._session_uuid or expected == self._session_uuid:
+            return
+        self._session_uuid = expected
+        # Ownership belonged to the old session; the app must select us again.
+        self._renderer_active = False
+        self._activation_request = None
+        logger.warning(
+            "[%s] Server expects session %s, rejoining it",
+            self.config.device.name,
+            uuid.UUID(bytes=expected),
+        )
 
     async def _wait_for_valid_token(self, buffer_s: int = 0) -> bool:
         """Obtain a non-expired token, or wait until one arrives or shutdown is requested.
