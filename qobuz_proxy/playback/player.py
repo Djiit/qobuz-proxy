@@ -123,6 +123,10 @@ class QobuzPlayer:
         self._volume: int = 50  # Cached volume level (0-100)
         self._fixed_volume: bool = False  # From config
         self._volume_report_callback: Optional[Callable[[int], asyncio.Future]] = None
+        # The app moves its slider to every volume we report, so during a drag
+        # burst skip superseded commands and never report an older volume.
+        self._volume_lock = asyncio.Lock()
+        self._volume_generation = 0
 
         # File quality report callback - called when track starts playing
         self._file_quality_report_callback: Optional[Callable[[int], asyncio.Future]] = None
@@ -277,12 +281,17 @@ class QobuzPlayer:
             logger.debug(f"Fixed volume mode: ignoring set_volume({level})")
             return self._volume  # Return current (ignored)
 
-        # Apply to backend
-        await self.backend.set_volume(clamped)
-        self._volume = clamped
-
-        # Report change to app
-        await self._report_volume_change()
+        self._volume_generation += 1
+        generation = self._volume_generation
+        async with self._volume_lock:
+            if generation != self._volume_generation:
+                logger.debug(f"Volume {clamped} superseded by a newer command")
+                return clamped
+            await self.backend.set_volume(clamped)
+            self._volume = clamped
+            if generation != self._volume_generation:
+                return clamped
+            await self._report_volume_change()
 
         logger.info(f"Volume set to {clamped}")
         return clamped
@@ -333,9 +342,13 @@ class QobuzPlayer:
         `RndrSrvrVolumeChanged` to a freshly-subscribed controller, leaving the
         device picker without a volume bar until we send it again.
         """
+        generation = self._volume_generation
         try:
-            volume = await self.get_volume()
-            await self._report_volume_change()
+            async with self._volume_lock:
+                volume = await self.get_volume()
+                if generation != self._volume_generation:
+                    return
+                await self._report_volume_change()
             logger.info(f"Re-broadcast current volume to app: {volume}%")
         except Exception as e:
             logger.warning(f"Failed to re-broadcast volume: {e}")
