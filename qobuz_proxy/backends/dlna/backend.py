@@ -226,8 +226,13 @@ class DLNABackend(AudioBackend):
         A skip (Stop, then Play) and an auto-advance both pass through that
         state. Nothing plays there, so it is not a takeover; it only becomes
         one once another source actually plays. Any other URI fails closed.
+        While it enters standby, CurrentURI can be empty for a moment, so the
+        dummy TrackURI is read instead; it is the same placeholder.
         """
-        if self._is_sonos or not self._client or not observed.startswith(SOUNDTOUCH_IDLE_SCHEME):
+        placeholder = (
+            observed.startswith(SOUNDTOUCH_IDLE_SCHEME) or observed == SOUNDTOUCH_IDLE_TRACK_URI
+        )
+        if self._is_sonos or not self._client or not placeholder:
             return False
         transport = await self._client.get_transport_info()
         if not transport or transport in ("PLAYING", "TRANSITIONING"):
@@ -310,6 +315,14 @@ class DLNABackend(AudioBackend):
         if time.monotonic() - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS:
             return False
         if await self._idle_after_our_stop(expected, current_uri):
+            return False
+        # A skip's Play may have started or finished during the idle check.
+        if (
+            self._external_playback
+            or self._starting_playback
+            or self._stopping_playback
+            or expected != self._current_proxy_url
+        ):
             return False
         logger.warning(
             "[%s] Source mismatch: observed=%s expected=%s armed_at_read=%s armed_now=%s "

@@ -464,6 +464,67 @@ async def test_skip_on_renderer_idling_after_our_stop_keeps_the_session(rig):
     assert manager.is_renderer_active
 
 
+async def test_skip_through_empty_uri_placeholder_keeps_the_session(rig):
+    """Between Stop and the next Play the SoundTouch can report an empty
+    CurrentURI with its standby TrackURI. That is still its idle state after
+    our Stop, so the skip must play the next track and keep the session."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop(next_track_id="456")
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = SOUNDTOUCH_IDLE_TRACK_URI
+    assert not await backend.check_external_playback()
+    metadata = BackendTrackMetadata(track_id="456", title="Next", artist="Artist")
+    await backend.play(NEXT_URI, metadata)
+    client.set_av_transport_uri.assert_awaited_once()
+    assert not backend._external_playback
+    assert manager.is_renderer_active
+
+
+async def test_empty_uri_placeholder_without_our_stop_is_a_takeover(rig):
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    client.get_media_info.return_value = ""
+    client.get_track_uri.return_value = SOUNDTOUCH_IDLE_TRACK_URI
+    client.get_transport_info.return_value = "PAUSED_PLAYBACK"
+    assert await backend.check_external_playback()
+    assert not manager.is_renderer_active
+
+
+def _start_load(backend):
+    backend._starting_playback = True
+
+
+def _finish_load(backend):
+    backend._current_proxy_url = NEXT_URI
+
+
+@pytest.mark.parametrize("transport", ["PAUSED_PLAYBACK", "TRANSITIONING"])
+@pytest.mark.parametrize("load", [_start_load, _finish_load])
+async def test_track_load_during_idle_check_is_not_a_takeover(rig, load, transport):
+    """A source poll that began before a skip's Play reads the idle state while
+    the next track loads. The load must not count as another source."""
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop(next_track_id="456")
+    reading = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def read_transport():
+        reading.set()
+        await finish.wait()
+        return transport
+
+    client.get_transport_info.side_effect = read_transport
+    check = asyncio.create_task(backend.check_external_playback())
+    await reading.wait()
+    load(backend)
+    finish.set()
+    assert not await check
+    assert not backend._external_playback
+    assert manager.is_renderer_active
+
+
 async def test_poll_after_our_stop_does_not_release_idle_renderer(rig):
     backend, client, _, manager, _ = rig
     _soundtouch(backend, client)
