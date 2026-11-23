@@ -602,6 +602,54 @@ async def test_resume_clears_the_pause_marker(rig):
     assert not manager.is_renderer_active
 
 
+def _release_during_load(backend, client, media_uri_after, track_uri_after):
+    """A source check flags a takeover while our SetAVTransportURI is in flight."""
+
+    async def set_uri(url, didl):
+        backend._external_playback = True
+        await backend._on_external_playback()
+        client.get_media_info.return_value = media_uri_after
+        client.get_track_uri.return_value = track_uri_after
+        client.get_transport_info.return_value = "PLAYING"
+        return True
+
+    client.set_av_transport_uri.side_effect = set_uri
+
+
+async def test_track_load_in_flight_at_takeover_does_not_keep_playing(speaker_rig):
+    """Recorded on a SoundTouch: skip, our Stop, the load starts, the proxy
+    leaves the session mid-load, and the new track then played with nothing
+    controlling it while the player kept reporting PLAYING."""
+    _, backend, client, player, manager, _ = speaker_rig
+    _soundtouch(backend, client)
+    player._state = PlaybackState.PLAYING
+    player.metadata.get_streaming_url.return_value = NEXT_URI
+    _release_during_load(backend, client, "", NEXT_URI)
+
+    assert not await player.play_track(2, "456")
+
+    assert client.stop.await_count == 2
+    assert backend._external_playback
+    assert backend._current_proxy_url != NEXT_URI
+    assert player.state != PlaybackState.PLAYING
+    assert not manager.is_renderer_active
+
+
+async def test_track_load_in_flight_at_takeover_leaves_foreign_source_alone(rig):
+    backend, client, _, manager, _ = rig
+    _soundtouch(backend, client)
+    await backend.stop(next_track_id="456")
+    _release_during_load(backend, client, SPOTIFY_URI, SPOTIFY_URI)
+    metadata = BackendTrackMetadata(track_id="456", title="Next", artist="Artist")
+
+    with pytest.raises(RuntimeError, match="External source"):
+        await backend.play(NEXT_URI, metadata)
+
+    client.stop.assert_awaited_once()
+    assert backend._external_playback
+    assert not manager.is_renderer_active
+
+
 @pytest.mark.parametrize("uri", [None, ""])
 async def test_unknown_source_blocks_snapshot_without_relinquishing_session(rig, uri):
     backend, client, player, manager, tasks = rig
