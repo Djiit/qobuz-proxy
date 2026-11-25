@@ -548,6 +548,65 @@ class TestSessionSnapshotSeek:
         backend.seek.assert_awaited_with(100_000)
 
 
+class TestPausedSnapshotSeek:
+    """After a token refresh the renderer reconnects and the server replays the
+    paused session at the position we paused at. Seeking a paused Bose
+    SoundTouch makes it play, so the replay must not touch the renderer."""
+
+    async def _paused_player(self):
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await player.play_track(queue_item_id=8, track_id="47101423", position_ms=0)
+        player._current_duration_ms = 639_000
+        player._set_position(537_279)
+        await handler._handle_set_state(
+            _set_state_msg(track_id=47101423, queue_item_id=8, playing_state=3)
+        )
+        assert player.state == PlaybackState.PAUSED
+        backend.seek = AsyncMock()
+        backend.resume = AsyncMock(return_value=True)
+        return player, backend, handler
+
+    async def _reconnect(self, handler) -> None:
+        handler.note_connected()
+        await handler._handle_set_active(_set_active_msg(True))
+
+    async def test_reconnect_snapshot_at_paused_position_does_not_seek(self) -> None:
+        player, backend, handler = await self._paused_player()
+        await self._reconnect(handler)
+
+        await handler._handle_set_state(
+            _set_state_msg(track_id=47101423, queue_item_id=8, playing_state=3, position_ms=537_279)
+        )
+
+        backend.seek.assert_not_awaited()
+        backend.resume.assert_not_awaited()
+        assert player.state == PlaybackState.PAUSED
+        assert player.current_position_ms == 537_279
+
+    async def test_reconnect_snapshot_at_other_position_still_seeks(self) -> None:
+        """A snapshot far from where we paused carries a real position change."""
+        player, backend, handler = await self._paused_player()
+        await self._reconnect(handler)
+
+        await handler._handle_set_state(
+            _set_state_msg(track_id=47101423, queue_item_id=8, playing_state=3, position_ms=100_000)
+        )
+
+        backend.seek.assert_awaited_once_with(100_000)
+
+    async def test_live_seek_while_paused_still_applies(self) -> None:
+        """Without a reconnect the same message is a user scrub and must seek."""
+        player, backend, handler = await self._paused_player()
+
+        await handler._handle_set_state(
+            _set_state_msg(track_id=47101423, queue_item_id=8, playing_state=3, position_ms=537_279)
+        )
+
+        backend.seek.assert_awaited_once_with(537_279)
+
+
 def _position_only_msg(position_ms: int):
     """SET_STATE carrying only a position, no item or playing state."""
     msg = pb.QConnectMessage()
