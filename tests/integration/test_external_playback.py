@@ -722,6 +722,8 @@ async def test_unknown_source_blocks_snapshot_without_relinquishing_session(rig,
 
     # A transient read failure must not require a new device selection.
     client.get_track_uri.return_value = QOBUZ_URI
+    # Away from the snapshot position, or the replay would change nothing.
+    player._set_position(30000)
     await deliver_snapshot(manager, tasks, 3)
     client.seek.assert_awaited_once_with(4000)
     assert player.state == PlaybackState.PAUSED

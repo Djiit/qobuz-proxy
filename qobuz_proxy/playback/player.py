@@ -562,6 +562,10 @@ class QobuzPlayer:
             stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
             if not stale and session_snapshot:
                 stale = self._is_stale_playing_snapshot_locked(track_id, position_ms)
+            # Evaluated before any load so it compares against the paused track.
+            unchanged_pause = session_snapshot and self._is_unchanged_paused_snapshot_locked(
+                track_id, position_ms, playing_state
+            )
 
             if (
                 self._skip_pending_track is not None
@@ -698,7 +702,7 @@ class QobuzPlayer:
                             )
 
             # Position, then play/pause/stop — same order as the app expects.
-            if position_ms is not None and not stale:
+            if position_ms is not None and not stale and not unchanged_pause:
                 await self.seek(position_ms)
 
             if playing_state is not None and not stale:
@@ -753,6 +757,33 @@ class QobuzPlayer:
             position_ms,
             actual_pos,
             gap_ms / 1000.0,
+        )
+        return True
+
+    def _is_unchanged_paused_snapshot_locked(
+        self,
+        track_id: Optional[str],
+        position_ms: Optional[int],
+        playing_state: Optional[int],
+    ) -> bool:
+        """Whether a session-restore snapshot only repeats our paused state.
+
+        A token refresh reconnects while paused, and the server replays PAUSED
+        at the position we paused at. Seeking a paused Bose SoundTouch starts
+        playback, so the replay's seek must not reach the renderer.
+        """
+        if playing_state != 3 or self._state != PlaybackState.PAUSED:
+            return False
+        if position_ms is None:
+            return False
+        cur = self._current_track
+        if track_id is not None and (cur is None or cur.track_id != track_id):
+            return False
+        if abs(self.current_position_ms - position_ms) > _STALE_SNAPSHOT_THRESHOLD_MS:
+            return False
+        logger.info(
+            "Ignoring session snapshot seek: already paused at %dms on the same track",
+            self.current_position_ms,
         )
         return True
 
